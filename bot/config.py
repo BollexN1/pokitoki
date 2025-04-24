@@ -1,59 +1,67 @@
 """Bot configuration parameters."""
 
 import os
-from typing import Any, Optional
+from typing import Any, Optional, List, Dict
 import yaml
 import dataclasses
 from dataclasses import dataclass
-
+from pathlib import Path
 
 @dataclass
 class Telegram:
     token: str
-    usernames: list
-    admins: list
-    chat_ids: list
-
+    usernames: List[str]
+    admins: List[str]
+    chat_ids: List[str]
 
 @dataclass
-class OpenAI:
+class AIProvider:
+    provider: str
     url: str
     api_key: str
     model: str
     image_model: str
-    window: int
     prompt: str
-    params: dict
+    window: int
+    params: Dict
 
-    default_url = "https://api.openai.com/v1"
-    default_model = "gpt-4o-mini"
-    default_image_model = "dall-e-3"
-    default_window = 128000
-    default_prompt = "You are an AI assistant."
+    default_urls = {
+        "openai": "https://api.openai.com/v1",
+        "gemini": "https://generativelanguage.googleapis.com/v1beta",
+        "deepseek": "https://api.deepseek.com/v1"
+    }
+    default_models = {
+        "openai": "gpt-3.5-turbo",
+        "gemini": "gemini-pro",
+        "deepseek": "deepseek-chat"
+    }
     default_params = {
         "temperature": 0.7,
-        "max_tokens": 4096,
+        "max_tokens": 1000,
+        "frequency_penalty": 0,
+        "presence_penalty": 0
     }
 
     def __init__(
         self,
+        provider: str,
         url: str,
         api_key: str,
         model: str,
         image_model: str,
-        window: int,
         prompt: str,
-        params: dict,
+        window: int,
+        params: Dict,
     ) -> None:
-        self.url = url or self.default_url
+        self.provider = provider
+        self.url = url or self.default_urls.get(provider, "https://api.openai.com/v1")
         self.api_key = api_key
-        self.model = model or self.default_model
-        self.image_model = image_model or self.default_image_model
-        self.window = window or self.default_window
-        self.prompt = prompt or self.default_prompt
+        self.model = model or self.default_models.get(provider, "gpt-3.5-turbo")
+        self.image_model = image_model or "dall-e-3"
+        self.prompt = prompt or ""
+        self.window = window or 128000
         self.params = self.default_params.copy()
         self.params.update(params)
-
 
 @dataclass
 class RateLimit:
@@ -72,7 +80,6 @@ class RateLimit:
     def __bool__(self) -> bool:
         return self.count > 0
 
-
 @dataclass
 class Conversation:
     depth: int
@@ -80,10 +87,9 @@ class Conversation:
 
     default_depth = 3
 
-    def __init__(self, depth: int, message_limit: dict) -> None:
+    def __init__(self, depth: int, message_limit: Dict) -> None:
         self.depth = depth or self.default_depth
         self.message_limit = RateLimit(**message_limit)
-
 
 @dataclass
 class Imagine:
@@ -91,9 +97,8 @@ class Imagine:
 
     def __init__(self, enabled: str) -> None:
         self.enabled = (
-            enabled if enabled in ("none", "users_only", "users_and_groups") else "users_only"
+            enabled if enabled in ("none", "users_only", "users_and_groups", "disabled") else "disabled"
         )
-
 
 class Config:
     """Config properties."""
@@ -103,7 +108,7 @@ class Config:
     # Bot version.
     version = 227
 
-    def __init__(self, filename: str, src: dict) -> None:
+    def __init__(self, filename: str, src: Dict) -> None:
         # Config filename.
         self.filename = filename
 
@@ -115,15 +120,17 @@ class Config:
             chat_ids=src["telegram"].get("chat_ids") or [],
         )
 
-        # OpenAI settings.
-        self.openai = OpenAI(
-            url=src["openai"].get("url"),
-            api_key=src["openai"]["api_key"],
-            model=src["openai"].get("model"),
-            image_model=src["openai"].get("image_model"),
-            window=src["openai"].get("window"),
-            prompt=src["openai"].get("prompt"),
-            params=src["openai"].get("params") or {},
+        # AI Provider settings.
+        ai_data = src.get("ai", {})
+        self.ai_provider = AIProvider(
+            provider=ai_data.get("provider", "openai"),
+            url=ai_data.get("url"),
+            api_key=ai_data.get("api_key", ""),
+            model=ai_data.get("model"),
+            image_model=ai_data.get("image_model"),
+            prompt=ai_data.get("prompt"),
+            window=ai_data.get("window"),
+            params=ai_data.get("params", {}),
         )
 
         # Conversation settings.
@@ -133,7 +140,7 @@ class Config:
         )
 
         # Image generation settings.
-        self.imagine = Imagine(enabled=src["imagine"].get("enabled") or "")
+        self.imagine = Imagine(enabled=src["imagine"].get("enabled") or "disabled")
 
         # Where to store the chat context file.
         self.persistence_path = src.get("persistence_path") or "./data/persistence.pkl"
@@ -141,24 +148,23 @@ class Config:
         # Custom AI commands (additional prompts).
         self.shortcuts = src.get("shortcuts") or {}
 
-    def as_dict(self) -> dict:
+    def as_dict(self) -> Dict:
         """Converts the config into a dictionary."""
         return {
             "schema_version": self.schema_version,
             "telegram": dataclasses.asdict(self.telegram),
-            "openai": dataclasses.asdict(self.openai),
+            "ai": dataclasses.asdict(self.ai_provider),
             "conversation": dataclasses.asdict(self.conversation),
             "imagine": dataclasses.asdict(self.imagine),
             "persistence_path": self.persistence_path,
             "shortcuts": self.shortcuts,
         }
 
-
 class ConfigEditor:
     """
     Config properties editor.
     Gets/sets config properties by their 'path',
-    e.g. 'openai.params.temperature' or 'conversation.depth'.
+    e.g. 'ai.params.temperature' or 'conversation.depth'.
     """
 
     # These properties cannot be changed at all.
@@ -170,7 +176,7 @@ class ConfigEditor:
     # Changes made to these properties take effect immediately.
     immediate = [
         "telegram",
-        "openai",
+        "ai",
         "conversation",
         "imagine",
         "shortcuts",
@@ -214,7 +220,7 @@ class ConfigEditor:
 
         raise ValueError(f"Failed to get property: {property}")
 
-    def set_value(self, property: str, value: str) -> tuple[bool, bool]:
+    def set_value(self, property: str, value: str) -> tuple[bool, bool, Any]:
         """
         Changes a config property value.
         Returns a tuple `(has_changed, is_immediate, new_val)`
@@ -283,12 +289,11 @@ class ConfigEditor:
         with open(self.config.filename, "w") as file:
             yaml.safe_dump(data, file, indent=4, allow_unicode=True)
 
-
 class SchemaMigrator:
     """Migrates the configuration data dictionary according to the schema version."""
 
     @classmethod
-    def migrate(cls, data: dict) -> tuple[dict, bool]:
+    def migrate(cls, data: Dict) -> tuple[Dict, bool]:
         """Migrates the configuration to the latest schema version."""
         has_changed = False
         if data.get("schema_version", 1) == 1:
@@ -303,11 +308,11 @@ class SchemaMigrator:
         return data, has_changed
 
     @classmethod
-    def _migrate_v1(cls, old: dict) -> dict:
+    def _migrate_v1(cls, old: Dict) -> Dict:
         data = {
             "schema_version": 2,
             "telegram": None,
-            "openai": None,
+            "ai": None,
             "max_history_depth": old.get("max_history_depth"),
             "imagine": old.get("imagine"),
             "persistence_path": old.get("persistence_path"),
@@ -318,18 +323,19 @@ class SchemaMigrator:
             "usernames": old.get("telegram_usernames"),
             "chat_ids": old.get("telegram_chat_ids"),
         }
-        data["openai"] = {
-            "api_key": old["openai_api_key"],
-            "model": old.get("openai_model"),
+        data["ai"] = {
+            "provider": old.get("ai_provider", "openai"),
+            "api_key": old["ai_api_key"],
+            "model": old.get("ai_model"),
         }
         return data
 
     @classmethod
-    def _migrate_v2(cls, old: dict) -> dict:
+    def _migrate_v2(cls, old: Dict) -> Dict:
         data = {
             "schema_version": 3,
             "telegram": old["telegram"],
-            "openai": old["openai"],
+            "ai": old["ai"],
             "imagine": old.get("imagine"),
             "persistence_path": old.get("persistence_path"),
             "shortcuts": old.get("shortcuts"),
@@ -337,11 +343,12 @@ class SchemaMigrator:
         data["conversation"] = {"depth": old.get("max_history_depth") or Conversation.default_depth}
         return data
 
-    def _migrate_v3(old: dict) -> dict:
+    @classmethod
+    def _migrate_v3(cls, old: Dict) -> Dict:
         data = {
             "schema_version": 4,
             "telegram": old["telegram"],
-            "openai": old["openai"],
+            "ai": old["ai"],
             "conversation": old["conversation"],
             "persistence_path": old.get("persistence_path"),
             "shortcuts": old.get("shortcuts"),
@@ -351,8 +358,7 @@ class SchemaMigrator:
         data["imagine"] = {"enabled": "users_only" if imagine_enabled else "none"}
         return data
 
-
-def load(filename) -> dict:
+def load(filename: str = "config.yml") -> Dict:
     """Loads the configuration data dictionary from a file."""
     with open(filename, "r") as f:
         data = yaml.safe_load(f)
@@ -363,7 +369,44 @@ def load(filename) -> dict:
             yaml.safe_dump(data, f, indent=4, allow_unicode=True)
     return data
 
+def load_config(config_path: str = "config.yml") -> Config:
+    data = load(config_path)
+    ai_data = data.get("ai", {})
+    return Config(
+        filename=config_path,
+        src=data,
+    )
+
+def save_config(config: Config, config_path: str = "config.yml") -> None:
+    data = {
+        "conversation": {
+            "depth": config.conversation.depth,
+            "message_limit": {"count": 0, "period": "hour"}
+        },
+        "imagine": {"enabled": config.imagine.enabled},
+        "ai": {
+            "provider": config.ai_provider.provider,
+            "api_key": config.ai_provider.api_key,
+            "url": config.ai_provider.url,
+            "model": config.ai_provider.model,
+            "params": config.ai_provider.params,
+            "image_model": config.ai_provider.image_model,
+            "prompt": config.ai_provider.prompt,
+            "window": config.ai_provider.window
+        },
+        "shortcuts": config.shortcuts,
+        "telegram": {
+            "token": config.telegram.token,
+            "usernames": config.telegram.usernames,
+            "chat_ids": config.telegram.chat_ids,
+            "admins": config.telegram.admins
+        },
+        "persistence_path": config.persistence_path,
+        "schema_version": 4
+    }
+    with open(config_path, "w") as file:
+        yaml.safe_dump(data, file, sort_keys=False)
 
 filename = os.getenv("CONFIG", "config.yml")
-_config = load(filename)
+_config = load_config(filename)
 config = Config(filename, _config)
