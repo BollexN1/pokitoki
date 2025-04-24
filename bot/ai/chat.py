@@ -1,59 +1,155 @@
-import openai
+"""AI language model compatible with multiple providers (OpenAI, DeepSeek, Gemini)."""
+
+import logging
+import httpx
 import requests
 import json
-from typing import List, Dict, Iterator
-from bot.config import Config
-from bot.models import ChatModel
+from typing import Optional, List, Dict, Iterator
+from bot.config import config
 
-class Chat:
-    def __init__(self, config: Config):
-        self.config = config
-        self.client = openai.OpenAI(
-            api_key=config.ai_api_key,
-            base_url=config.ai_url
+client = httpx.AsyncClient(timeout=60.0)
+logger = logging.getLogger(__name__)
+
+# Known models and their context windows
+MODELS = {
+    # Gemini
+    "gemini-2.0-flash": 1_048_576,
+    "gemini-1.5-flash": 1_048_576,
+    "gemini-1.5-flash-8b": 1_048_576,
+    "gemini-1.5-pro": 2_097_152,
+    # OpenAI
+    "o1": 200000,
+    "o1-preview": 128000,
+    "o1-mini": 128000,
+    "o3-mini": 200000,
+    "gpt-4o": 128000,
+    "gpt-4o-mini": 128000,
+    "gpt-4-turbo": 128000,
+    "gpt-4-turbo-preview": 128000,
+    "gpt-4-vision-preview": 128000,
+    "gpt-4": 8192,
+    "gpt-4-32k": 32768,
+    "gpt-3.5-turbo": 16385,
+    # DeepSeek
+    "deepseek-chat": 128000,  # DeepSeek-V3
+    "deepseek-reasoner": 128000,  # DeepSeek-R1
+}
+
+# Prompt role name overrides.
+ROLE_OVERRIDES = {
+    "o1": "user",
+    "o1-preview": "user",
+    "o1-mini": "user",
+    "o3-mini": "user",
+    "deepseek-chat": "system",
+    "deepseek-reasoner": "system",
+}
+# Model parameter overrides.
+PARAM_OVERRIDES = {
+    "o1": lambda params: {},
+    "o1-preview": lambda params: {},
+    "o1-mini": lambda params: {},
+    "o3-mini": lambda params: {},
+    "deepseek-chat": lambda params: params,
+    "deepseek-reasoner": lambda params: params,
+}
+
+
+class Model:
+    """AI API wrapper."""
+
+    def __init__(self, name: str) -> None:
+        """Creates a wrapper for a given AI large language model."""
+        self.name = name
+
+    async def ask(self, prompt: str, question: str, history: List[tuple[str, str]]) -> str:
+        """Asks the language model a question and returns an answer."""
+        model = self.name
+        prompt_role = ROLE_OVERRIDES.get(model) or "system"
+        params_func = PARAM_OVERRIDES.get(model) or (lambda params: params)
+
+        n_input = _calc_n_input(model, n_output=config.ai.params["max_tokens"])
+        messages = self._generate_messages(prompt_role, prompt, question, history)
+        messages = shorten(messages, length=n_input)
+
+        params = params_func(config.ai.params)
+        logger.debug(
+            f"> chat request: model=%s, params=%s, messages=%s",
+            model,
+            params,
+            messages,
         )
-        self.history: Dict[str, List[Dict]] = {}
 
-    def ask(self, chat_id: str, prompt: str, model: ChatModel) -> str:
-        messages = self._get_history(chat_id) + [{"role": "user", "content": self.config.prompt + prompt}]
-        if self.config.ai_provider == "deepseek":
-            return self._deepseek_chat(messages, model.name)
-        else:
-            response = self.client.chat.completions.create(
-                model=model.name,
-                messages=messages,
-                **self.config.ai_params
-            )
-            answer = response.choices[0].message.content
-            self._update_history(chat_id, prompt, answer)
-            return answer
+        if config.ai.provider == "deepseek":
+            return await self._deepseek_ask(messages, model, params)
+        
+        response = await client.post(
+            f"{config.ai.url}/chat/completions",
+            headers={"Authorization": f"Bearer {config.ai.api_key}"},
+            json={
+                "model": model,
+                "messages": messages,
+                **params,
+            },
+        )
+        resp = response.json()
+        if "usage" not in resp:
+            raise Exception(resp)
+        logger.debug(
+            "< chat response: prompt_tokens=%s, completion_tokens=%s, total_tokens=%s",
+            resp["usage"]["prompt_tokens"],
+            resp["usage"]["completion_tokens"],
+            resp["usage"]["total_tokens"],
+        )
+        answer = self._prepare_answer(resp)
+        return answer
 
-    def chat_completion(self, chat_id: str, prompt: str, model: ChatModel, thinking_enabled: bool = False, search_enabled: bool = False) -> Iterator[Dict]:
-        messages = self._get_history(chat_id) + [{"role": "user", "content": self.config.prompt + prompt}]
-        if self.config.ai_provider != "deepseek":
+    async def chat_completion(
+        self,
+        prompt: str,
+        question: str,
+        history: List[tuple[str, str]],
+        thinking_enabled: bool = False,
+        search_enabled: bool = False
+    ) -> Iterator[Dict]:
+        """Asks the language model a question and streams the response with thinking/search steps."""
+        if config.ai.provider != "deepseek":
             yield {"type": "text", "content": "Streaming is only supported with DeepSeek provider."}
             return
 
+        model = "deepseek-reasoner" if thinking_enabled or search_enabled else self.name
+        prompt_role = ROLE_OVERRIDES.get(model) or "system"
+        params_func = PARAM_OVERRIDES.get(model) or (lambda params: params)
+
+        n_input = _calc_n_input(model, n_output=config.ai.params["max_tokens"])
+        messages = self._generate_messages(prompt_role, prompt, question, history)
+        messages = shorten(messages, length=n_input)
+
+        params = params_func(config.ai.params)
+        logger.debug(
+            f"> streaming chat request: model=%s, params=%s, messages=%s, thinking=%s, search=%s",
+            model,
+            params,
+            messages,
+            thinking_enabled,
+            search_enabled,
+        )
+
         headers = {
-            "Authorization": f"Bearer {self.config.ai_api_key}",
+            "Authorization": f"Bearer {config.ai.api_key}",
             "Content-Type": "application/json"
         }
         data = {
-            "model": model.name,
+            "model": model,
             "messages": messages,
-            "max_tokens": self.config.ai_params.get("max_tokens", 500),
-            "temperature": self.config.ai_params.get("temperature", 0.7),
-            "frequency_penalty": self.config.ai_params.get("frequency_penalty", 0),
-            "presence_penalty": self.config.ai_params.get("presence_penalty", 0),
             "stream": True,
             "thinking_enabled": thinking_enabled,
-            "search_enabled": search_enabled
+            "search_enabled": search_enabled,
+            **params
         }
-        if thinking_enabled and search_enabled:
-            data["model"] = "deepseek-r1"  # Для thinking + search используем deepseek-r1
 
         response = requests.post(
-            f"{self.config.ai_url}/chat/completions",
+            f"{config.ai.url}/chat/completions",
             headers=headers,
             json=data,
             stream=True
@@ -70,8 +166,9 @@ class Chat:
                         break
                     try:
                         chunk_json = json.loads(chunk_data)
-                        chunk_type = chunk_json.get("type", "text")
-                        content = chunk_json.get("content", "")
+                        delta = chunk_json.get("choices", [{}])[0].get("delta", {})
+                        content = delta.get("content", "")
+                        chunk_type = delta.get("type", "text")
                         if chunk_type in ["thinking", "text"]:
                             yield {"type": chunk_type, "content": content}
                             if chunk_type == "text":
@@ -80,40 +177,100 @@ class Chat:
                         continue
 
         if buffer:
-            self._update_history(chat_id, prompt, buffer)
+            # Store the final answer in history
+            history.append((question, buffer))
 
-    def search(self, chat_id: str, query: str, model: ChatModel) -> Iterator[Dict]:
-        for chunk in self.chat_completion(chat_id, query, model, thinking_enabled=True, search_enabled=True):
-            yield chunk
-
-    def thinking(self, chat_id: str, query: str, model: ChatModel) -> Iterator[Dict]:
-        for chunk in self.chat_completion(chat_id, query, model, thinking_enabled=True, search_enabled=False):
-            yield chunk
-
-    def _deepseek_chat(self, messages: List[Dict], model: str) -> str:
+    async def _deepseek_ask(self, messages: List[Dict], model: str, params: Dict) -> str:
+        """Asks the DeepSeek API for a non-streaming response."""
         headers = {
-            "Authorization": f"Bearer {self.config.ai_api_key}",
+            "Authorization": f"Bearer {config.ai.api_key}",
             "Content-Type": "application/json"
         }
         data = {
             "model": model,
             "messages": messages,
-            "max_tokens": self.config.ai_params.get("max_tokens", 500),
-            "temperature": self.config.ai_params.get("temperature", 0.7),
-            "frequency_penalty": self.config.ai_params.get("frequency_penalty", 0),
-            "presence_penalty": self.config.ai_params.get("presence_penalty", 0)
+            **params
         }
-        response = requests.post(f"{self.config.ai_url}/chat/completions", headers=headers, json=data)
-        response.raise_for_status()
-        return response.json()["choices"][0]["message"]["content"]
+        response = await client.post(
+            f"{config.ai.url}/chat/completions",
+            headers=headers,
+            json=data
+        )
+        resp = response.json()
+        if "usage" not in resp:
+            raise Exception(resp)
+        logger.debug(
+            "< chat response: prompt_tokens=%s, completion_tokens=%s, total_tokens=%s",
+            resp["usage"]["prompt_tokens"],
+            resp["usage"]["completion_tokens"],
+            resp["usage"]["total_tokens"],
+        )
+        answer = self._prepare_answer(resp)
+        return answer
 
-    def _get_history(self, chat_id: str) -> List[Dict]:
-        if chat_id not in self.history:
-            self.history[chat_id] = []
-        return self.history[chat_id][-self.config.history_depth:]
+    def _generate_messages(
+        self, prompt_role: str, prompt: str, question: str, history: List[tuple[str, str]]
+    ) -> List[Dict]:
+        """Builds message history to provide context for the language model."""
+        messages = [{"role": prompt_role, "content": prompt or config.ai.prompt}]
+        for prev_question, prev_answer in history:
+            messages.append({"role": "user", "content": prev_question})
+            messages.append({"role": "assistant", "content": prev_answer})
+        messages.append({"role": "user", "content": question})
+        return messages
 
-    def _update_history(self, chat_id: str, prompt: str, answer: str):
-        if chat_id not in self.history:
-            self.history[chat_id] = []
-        self.history[chat_id].append({"role": "user", "content": prompt})
-        self.history[chat_id].append({"role": "assistant", "content": answer})
+    def _prepare_answer(self, resp) -> str:
+        """Post-processes an answer from the language model."""
+        if len(resp["choices"]) == 0:
+            raise ValueError("received an empty answer")
+
+        answer = resp["choices"][0]["message"]["content"]
+        answer = answer.strip()
+        return answer
+
+
+def shorten(messages: List[Dict], length: int) -> List[Dict]:
+    """
+    Truncates messages so that the total number of tokens
+    does not exceed the specified length.
+    """
+    lengths = [_calc_tokens(m["content"]) for m in messages]
+    total_len = sum(lengths)
+    if total_len <= length:
+        return messages
+
+    # exclude older messages to fit into the desired length
+    # can't exclude the prompt though
+    prompt_msg, messages = messages[0], messages[1:]
+    prompt_len, lengths = lengths[0], lengths[1:]
+    while len(messages) > 1 and total_len > length:
+        messages = messages[1:]
+        first_len, lengths = lengths[0], lengths[1:]
+        total_len -= first_len
+    messages = [prompt_msg] + messages
+    if total_len <= length:
+        return messages
+
+    # there is only one message left, and it's still longer than allowed
+    # so we have to shorten it
+    maxlen = length - prompt_len
+    tokens = messages[1]["content"].split()[:maxlen]
+    messages[1]["content"] = " ".join(tokens)
+    return messages
+
+
+def _calc_tokens(s: str) -> int:
+    """Calculates the number of tokens in a string."""
+    return int(len(s.split()) * 1.2)
+
+
+def _calc_n_input(name: str, n_output: int) -> int:
+    """
+    Calculates the maximum number of input tokens
+    according to the model and the maximum number of output tokens.
+    """
+    # AI providers count length in tokens, not characters.
+    # We need to leave some tokens reserved for the output.
+    n_total = MODELS.get(name) or config.ai.window
+    logger.debug("model=%s, n_total=%s, n_output=%s", name, n_total, n_output)
+    return n_total - n_output
