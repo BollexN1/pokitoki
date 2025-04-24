@@ -1,4 +1,4 @@
-"""Telegram chat bot built using the language model from OpenAI."""
+"""Telegram chat bot built using the language model from various AI providers."""
 
 import logging
 import sys
@@ -17,7 +17,6 @@ from telegram.ext import (
 from bot import askers
 from bot import commands
 from bot import questions
-from bot import models
 from bot.config import config
 from bot.fetcher import Fetcher
 from bot.filters import Filters
@@ -85,6 +84,12 @@ def add_handlers(application: Application):
     application.add_handler(
         CommandHandler("retry", commands.Retry(reply_to), filters=filters.users_or_chats)
     )
+    application.add_handler(
+        CommandHandler("search", commands.Search(reply_to), filters=filters.users_or_chats)
+    )
+    application.add_handler(
+        CommandHandler("think", commands.Think(reply_to), filters=filters.users_or_chats)
+    )
 
     # non-command handler: the default action is to reply to a message
     application.add_handler(MessageHandler(filters.messages, commands.Message(reply_to)))
@@ -100,8 +105,9 @@ async def post_init(application: Application) -> None:
     logging.info(f"allowed users: {config.telegram.usernames}")
     logging.info(f"allowed chats: {config.telegram.chat_ids}")
     logging.info(f"admins: {config.telegram.admins}")
-    logging.info(f"api url: {config.openai.url}")
-    logging.info(f"model name: {config.openai.model}")
+    logging.info(f"ai provider: {config.ai.provider}")
+    logging.info(f"api url: {config.ai.url}")
+    logging.info(f"model name: {config.ai.model}")
     logging.info(f"bot: username={bot.username}, id={bot.id}")
     await bot.set_my_commands(commands.BOT_COMMANDS)
 
@@ -151,7 +157,7 @@ async def reply_to(
 
     try:
         chat = ChatData(context.chat_data)
-        model = chat.model or config.openai.model
+        model = chat.model or config.ai.model
         asker = askers.create(model=model, question=question)
         if message.chat.type == Chat.PRIVATE and message.forward_date:
             # this is a forwarded message, don't answer yet
@@ -175,7 +181,7 @@ async def reply_to(
 async def _ask_question(
     message: Message, context: CallbackContext, question: str, asker: askers.Asker
 ) -> str:
-    """Answers a question using the OpenAI model."""
+    """Answers a question using the AI model."""
     user_id = message.from_user.username or message.from_user.id
     logger.info(f"-> question id={message.id}, user={user_id}, n_chars={len(question)}")
 
